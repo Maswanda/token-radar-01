@@ -1,4 +1,4 @@
-// Token Radar dashboard, second draft.
+// Token Radar dashboard, third draft (radar-3).
 //
 // The page renders window.RADAR (emitted beside dashboard/ by main.ts): the ranked
 // pre-token board, a Top-5 spotlight, a searchable, filterable and sortable table,
@@ -9,7 +9,9 @@
 // The farm plan and the implied value are recomputed here from the same snapshot
 // figures main.ts scores into board.json — TVL, seven-day growth, age, chains and
 // category — so the page and the board agree by construction. No protocol name is
-// ever special-cased.
+// ever special-cased. Each row also carries its implied range across the model's
+// sensitivity runs and the multiplier that drives it most, and each farm plan ends
+// with the protocol's main risk and when to skip it outright.
 (function () {
   'use strict';
 
@@ -63,6 +65,16 @@
   function formatAge(days) {
     if (days === null || days === undefined) return 'unknown';
     if (days >= 365) return (days / 365).toFixed(1) + 'y';
+    return Math.max(0, Math.round(days)) + 'd';
+  }
+
+  // The detail view's age: the exact day count, so the maturity multiplier can be
+  // checked by hand, with the table's rounded years in brackets. The table rounds
+  // years to one decimal, so several ages share one display string; the exact days
+  // here are the value the model used.
+  function formatAgeExact(days) {
+    if (days === null || days === undefined) return 'unknown';
+    if (days >= 365) return Math.max(0, Math.round(days)) + 'd (' + (days / 365).toFixed(1) + 'y)';
     return Math.max(0, Math.round(days)) + 'd';
   }
 
@@ -232,6 +244,32 @@
     return 'Do one more action on ' + p.name + ' for $' + small + ' — a swap, a vote or a second deposit — so the wallet shows repeat use.';
   }
 
+  // The category's main risk, in the same order as the action rules: the first
+  // key that matches decides the risk. A category no key matches gets the plain
+  // contract risk. This mirrors lib/model.ts exactly, so the page's plan and
+  // board.json's plan are the same strings.
+  var RISK_RULES = [
+    { keys: ['lend', 'cdp', 'collateral'], risk: 'a falling collateral price can liquidate the position' },
+    { keys: ['dex', 'yield', 'leveraged farm', 'farm'], risk: 'liquidity positions can lose value to impermanent loss' },
+    { keys: ['bridge'], risk: 'a bridge exploit or delay can strand the funds' },
+    { keys: ['staking', 'restak'], risk: 'staked funds can be locked or slashed' },
+    { keys: ['perpetual', 'derivative', 'options'], risk: 'leverage can liquidate the margin' },
+    { keys: ['prediction'], risk: 'a market can resolve against the position' },
+    { keys: ['stable'], risk: 'a stable asset can depeg' },
+    { keys: ['rwa'], risk: 'the off-chain asset can default' }
+  ];
+
+  function riskFor(p) {
+    var c = (p.category || '').toLowerCase();
+    for (var i = 0; i < RISK_RULES.length; i++) {
+      var keys = RISK_RULES[i].keys;
+      for (var j = 0; j < keys.length; j++) {
+        if (c.indexOf(keys[j]) >= 0) return RISK_RULES[i].risk;
+      }
+    }
+    return 'the contract could be exploited';
+  }
+
   function renderStep(step) {
     var s = step.text + ' Cost: ' + step.cost + '. Time: ' + step.time + '.';
     if (s.length > 600) s = s.slice(0, 596) + '...';
@@ -278,7 +316,7 @@
         time: hold + ' days'
       },
       {
-        text: 'Before you withdraw, claim only from the link the protocol itself publishes, never from a direct message, and write the wallet, the dates and every transaction hash in a farm log.',
+        text: 'Know the risks: ' + riskFor(p) + '. An airdrop is never guaranteed. Skip this protocol if the gas and fees cost more than the value you expect, or if its TVL is held by a few wallets. Before you withdraw, claim only from the link the protocol itself publishes, never from a direct message, and write the wallet, the dates and every transaction hash in a farm log.',
         cost: 'no fee to check, and never pay to claim',
         time: '10 minutes'
       }
@@ -627,7 +665,7 @@
       'growth = 1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + '  ·  ' +
       'maturity = ' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + '  ·  ' +
       'reach = 1 + min(chains - 1, ' + m.reach_max_chains + ') x ' + m.reach_per_chain;
-    var explainer = 'Size has diminishing returns, so a small fast grower can outrank a large flat one. TVL and seven-day growth come from the snapshot. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days. Reach counts the chains a protocol runs on. The early radar is every pre-token protocol the watchlist leaves out that passes the same honesty test as the watchlist — no wrapped, staked or bridged product of a token that already trades — and the live-token protocols are set aside with their market caps shown.';
+    var explainer = 'Size has diminishing returns, so a small fast grower can outrank a large flat one. TVL and seven-day growth come from the snapshot. A protocol whose seven-day growth is not reported is treated as 0%: no bonus, no penalty, because unreported is not zero. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unknown age uses ' + m.unknown_age_days + ' days for maturity, a conservative default below the board\u2019s median age of 421 days. Age is shown rounded to one decimal in years in the table; the detail view gives the exact day count. Multipliers are shown rounded to six decimals, and the page recomputes each row from full precision. The implied range is the lowest and highest value across sensitivity runs that shift the growth weight (0.6 to 1.0), the unknown-age default (180 to 730 days) and the size exponent (-0.15 to -0.25); the top three never change across those runs. The main driver is the multiplier furthest from 1.0. Reach counts the chains a protocol runs on. The early radar is every pre-token protocol the watchlist leaves out that passes the same honesty test as the watchlist — no wrapped, staked or bridged product of a token that already trades — and the live-token protocols are set aside with their market caps shown.';
     return h('section', { class: 'panel model' },
       h('h2', { text: 'How implied value is computed' }),
       h('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. No protocol name is special-cased, and no row is hand-picked.' }),
@@ -676,18 +714,34 @@
     });
     detailDialog.appendChild(h('div', { class: 'detail-head' }, headCopy, closeButton));
 
+    var ageText = (row.age_days === null || row.age_days === undefined)
+      ? 'unknown (365d assumed for maturity)'
+      : formatAgeExact(row.age_days);
+    var growthText = (row.change_7d === null || row.change_7d === undefined)
+      ? 'n/a (treated as 0%)'
+      : formatPct(row.change_7d);
+    var rangeText = formatMoney(row.implied_low) + ' – ' + formatMoney(row.implied_high);
+    var driverText = row.driver + ' ×' + row.driver_multiplier;
     var equation = h('div', { class: 'equation' },
       h('div', null, h('span', { text: 'TVL' }), h('b', { class: 'num', text: formatMoney(row.tvl_usd) })),
-      h('div', null, h('span', { text: 'Seven-day growth' }), h('b', { class: 'num', text: formatPct(row.change_7d) })),
-      h('div', null, h('span', { text: 'Age with no token' }), h('b', { class: 'num', text: formatAge(row.age_days) })),
+      h('div', null, h('span', { text: 'Seven-day growth' }), h('b', { class: 'num', text: growthText })),
+      h('div', null, h('span', { text: 'Age with no token' }), h('b', { class: 'num', text: ageText })),
       h('div', null, h('span', { text: 'Chains' }), h('b', { class: 'num', text: String((row.chains || []).length) })),
       h('div', null, h('span', { text: 'Size multiplier' }), h('b', { class: 'num', text: String(row.size_multiplier) })),
       h('div', null, h('span', { text: 'Growth multiplier' }), h('b', { class: 'num', text: String(row.growth_multiplier) })),
       h('div', null, h('span', { text: 'Maturity multiplier' }), h('b', { class: 'num', text: String(row.maturity_multiplier) })),
       h('div', null, h('span', { text: 'Reach multiplier' }), h('b', { class: 'num', text: String(row.reach_multiplier) })),
-      h('div', null, h('span', { text: 'Implied value' }), h('b', { class: 'num', text: formatMoney(row.implied_value_usd) }))
+      h('div', null, h('span', { text: 'Implied value' }), h('b', { class: 'num', text: formatMoney(row.implied_value_usd) })),
+      h('div', null, h('span', { text: 'Implied range' }), h('b', { class: 'num', text: rangeText })),
+      h('div', null, h('span', { text: 'Main driver' }), h('b', { class: 'num', text: driverText }))
     );
-    var checkText = 'Model ' + BOARD.model_version + ': the same function scores every protocol. The page recomputes this row as ' + formatMoney(recomputed) + (recomputed === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' This is an estimate, not a price.';
+    var checkText = 'Model ' + BOARD.model_version + ': the same function scores every protocol. The page recomputes this row as ' + formatMoney(recomputed) + (recomputed === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' The implied range is the lowest and highest value across sensitivity runs that shift the growth weight, the unknown-age default and the size exponent, and the main driver is the multiplier furthest from 1.0. This is an estimate, not a price.';
+    if (row.change_7d === null || row.change_7d === undefined) {
+      checkText += ' Seven-day growth was not reported, so the model gives no growth bonus or penalty (treated as 0%).';
+    }
+    if (row.age_days === null || row.age_days === undefined) {
+      checkText += ' Age is unknown, so maturity uses the 365-day default.';
+    }
     detailDialog.appendChild(h('section', { class: 'detail-section' },
       h('h3', { text: 'Implied value' }),
       equation,

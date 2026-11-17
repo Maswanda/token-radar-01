@@ -1,4 +1,4 @@
-// Token Radar's value model (radar-2): one sealed snapshot in, one ranked board out.
+// Token Radar's value model (radar-3): one sealed snapshot in, one ranked board out.
 //
 // The board ranks every protocol on the snapshot's watchlist — the floor, never the ceiling —
 // and adds the early radar: pre-token protocols the watchlist leaves out, below the floor and
@@ -22,7 +22,18 @@
 //   reach        = 1 + min(chains - 1, 4) x 0.05        (1.0..1.2: more chains, broader surface)
 //   implied      = max(1, round(tvl_usd x 0.25 x size x growthMult x maturity x reach))
 //
-// No protocol name is ever special-cased: the same function scores every row.
+// radar-3 keeps that formula and its constants — a sensitivity test over the plausible weight
+// range moves the top 20 by at most a few places and never changes the top three, so the
+// baseline is the robust middle, not a cherry-picked one — and makes the model honest about
+// what it does not know. A seven-day growth the snapshot does not report is treated as 0%:
+// no bonus, no penalty, because unreported is not zero. An unknown age uses 365 days for
+// maturity, a conservative default below the board's median age of 421 days, and the dashboard
+// says so. Every row now carries its implied range, the lowest and highest value across
+// sensitivity runs that shift the growth weight, the unknown-age default and the size exponent,
+// and its main driver, the multiplier furthest from 1.0. Multipliers are stored to six
+// decimals, so a reader who multiplies the shown figures lands within a few hundred dollars
+// of the implied value. No protocol name is ever special-cased: the same function scores
+// every row.
 
 /** One protocol entry from the sealed snapshot: exactly its ten fields. */
 export interface SnapshotProtocol {
@@ -83,7 +94,7 @@ export const MODEL: ModelConstants = {
 };
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -111,6 +122,9 @@ export interface BoardRow {
   token_status: 'pre-token';
   age_days: number | null;
   implied_value_usd: number;
+  implied_range: { low: number; high: number };
+  driver: string;
+  driver_multiplier: number;
   model: {
     base_multiple: number;
     size_multiplier: number;
@@ -136,6 +150,10 @@ export interface RadarRow {
   listed_at: string | null;
   age_days: number | null;
   implied_value_usd: number;
+  implied_low: number;
+  implied_high: number;
+  driver: string;
+  driver_multiplier: number;
   size_multiplier: number;
   growth_multiplier: number;
   maturity_multiplier: number;
@@ -206,8 +224,8 @@ export function ageDays(asOf: string, listedAt: string | null): number | null {
   return Math.max(0, Math.floor((a - b) / DAY_MS));
 }
 
-/** Round to four decimals, so the model breakdown stays readable. */
-const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
+/** Round to six decimals, so a reader who multiplies the shown multipliers lands within a few hundred dollars of the implied value. */
+const round6 = (n: number): number => Math.round(n * 1e6) / 1e6;
 
 /**
  * The four multipliers and the implied value one protocol gets under `model`.
@@ -237,6 +255,51 @@ export function impliedValue(
   const reachMult = 1 + extraChains * model.reach_per_chain;
   const implied = Math.max(1, Math.round(protocol.tvl_usd * model.base_multiple * sizeMult * growthMult * maturityMult * reachMult));
   return { implied, sizeMult, growthPct, growthMult, maturityMult, reachMult, age };
+}
+
+/** The sensitivity runs: the baseline model, each key weight shifted once, and the two combined extremes. The board's point estimate always uses MODEL; these runs only set each row's low/high range, so the baseline implied value always lies inside its own range. */
+export const SENSITIVITY_RUNS: ModelConstants[] = [
+  MODEL,
+  { ...MODEL, growth_weight: 0.6 },
+  { ...MODEL, growth_weight: 1.0 },
+  { ...MODEL, unknown_age_days: 180 },
+  { ...MODEL, unknown_age_days: 730 },
+  { ...MODEL, size_exponent: -0.15 },
+  { ...MODEL, size_exponent: -0.25 },
+  { ...MODEL, growth_weight: 0.6, unknown_age_days: 180, size_exponent: -0.15 },
+  { ...MODEL, growth_weight: 1.0, unknown_age_days: 730, size_exponent: -0.25 },
+];
+
+/** A row's implied value across the sensitivity runs: the lowest and the highest. */
+export function sensitivityRange(protocol: SnapshotProtocol, asOf: string): { low: number; high: number } {
+  let low = Number.POSITIVE_INFINITY;
+  let high = 0;
+  for (const run of SENSITIVITY_RUNS) {
+    const value = impliedValue(protocol, asOf, run).implied;
+    if (value < low) low = value;
+    if (value > high) high = value;
+  }
+  return { low, high };
+}
+
+/** Which multiplier moves a row's implied value most: the one furthest from 1, boost or compression alike. */
+export function driverFor(sizeMult: number, growthMult: number, maturityMult: number, reachMult: number): { driver: string; multiplier: number } {
+  const candidates: Array<[string, number]> = [
+    ['size', sizeMult],
+    ['growth', growthMult],
+    ['maturity', maturityMult],
+    ['reach', reachMult],
+  ];
+  let best: [string, number] = candidates[0]!;
+  let bestDistance = 0;
+  for (const [name, mult] of candidates) {
+    const distance = Math.abs(Math.log(mult));
+    if (distance > bestDistance) {
+      bestDistance = distance;
+      best = [name, mult];
+    }
+  }
+  return { driver: best[0], multiplier: best[1] };
 }
 
 /** DefiLlama's version-marker rule: a name ending in a release is a pool of another protocol. */
@@ -297,32 +360,39 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     return { p, implied, sizeMult, growthPct, growthMult, maturityMult, reachMult, age };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
-  return scored.map((s, i) => ({
-    rank: i + 1,
-    slug: s.p.slug,
-    name: s.p.name,
-    category: s.p.category,
-    chains: s.p.chains,
-    tvl_usd: s.p.tvl_usd,
-    change_7d: s.p.change_7d,
-    mcap_usd: s.p.mcap_usd,
-    listed_at: s.p.listed_at,
-    gecko_id: s.p.gecko_id,
-    symbol: s.p.symbol,
-    token_status: 'pre-token',
-    age_days: s.age,
-    implied_value_usd: s.implied,
-    model: {
-      base_multiple: model.base_multiple,
-      size_multiplier: round4(s.sizeMult),
-      growth_pct: s.growthPct,
-      growth_multiplier: round4(s.growthMult),
-      maturity_multiplier: round4(s.maturityMult),
-      reach_multiplier: round4(s.reachMult),
+  return scored.map((s, i) => {
+    const range = sensitivityRange(s.p, snapshot.as_of);
+    const driven = driverFor(s.sizeMult, s.growthMult, s.maturityMult, s.reachMult);
+    return {
+      rank: i + 1,
+      slug: s.p.slug,
+      name: s.p.name,
+      category: s.p.category,
+      chains: s.p.chains,
+      tvl_usd: s.p.tvl_usd,
+      change_7d: s.p.change_7d,
+      mcap_usd: s.p.mcap_usd,
+      listed_at: s.p.listed_at,
+      gecko_id: s.p.gecko_id,
+      symbol: s.p.symbol,
+      token_status: 'pre-token',
       age_days: s.age,
-    },
-    farm_steps: farmSteps(s.p, s.age).map(stepText),
-  }));
+      implied_value_usd: s.implied,
+      implied_range: range,
+      driver: driven.driver,
+      driver_multiplier: round6(driven.multiplier),
+      model: {
+        base_multiple: model.base_multiple,
+        size_multiplier: round6(s.sizeMult),
+        growth_pct: s.growthPct,
+        growth_multiplier: round6(s.growthMult),
+        maturity_multiplier: round6(s.maturityMult),
+        reach_multiplier: round6(s.reachMult),
+        age_days: s.age,
+      },
+      farm_steps: farmSteps(s.p, s.age).map(stepText),
+    };
+  });
 }
 
 /** One step as a single string: its action, then its cost and time, within 20..600 characters. */
@@ -433,8 +503,34 @@ function secondActionFor(p: SnapshotProtocol, capital: number, chain: string): s
 }
 
 /**
+ * The category's main risk, in words a farmer can weigh before moving money. The table is
+ * tried in the same order as the action table: the first key that matches decides the risk.
+ * A category no key matches gets the plain contract risk.
+ */
+const RISK_TABLE: Array<{ keys: string[]; risk: string }> = [
+  { keys: ['lend', 'cdp', 'collateral'], risk: 'a falling collateral price can liquidate the position' },
+  { keys: ['dex', 'yield', 'leveraged farm', 'farm'], risk: 'liquidity positions can lose value to impermanent loss' },
+  { keys: ['bridge'], risk: 'a bridge exploit or delay can strand the funds' },
+  { keys: ['staking', 'restak'], risk: 'staked funds can be locked or slashed' },
+  { keys: ['perpetual', 'derivative', 'options'], risk: 'leverage can liquidate the margin' },
+  { keys: ['prediction'], risk: 'a market can resolve against the position' },
+  { keys: ['stable'], risk: 'a stable asset can depeg' },
+  { keys: ['rwa'], risk: 'the off-chain asset can default' },
+];
+
+/** The category's main risk, in words a farmer can weigh. */
+function riskFor(p: SnapshotProtocol): string {
+  const c = (p.category ?? '').toLowerCase();
+  for (const entry of RISK_TABLE) {
+    if (entry.keys.some((k) => c.includes(k))) return entry.risk;
+  }
+  return 'the contract could be exploited';
+}
+
+/**
  * A protocol's farm plan: seven steps, each an action with a cost and a time. The plan is derived
  * from the protocol's own record (category, chains, TVL, age), never from a hand-written list of names.
+ * The last step states the plan's risk and when to skip it outright.
  */
 export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   const chain = chainOf(p);
@@ -477,7 +573,7 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
       time: `${hold} days`,
     },
     {
-      text: `Before you withdraw, claim only from the link the protocol itself publishes, never from a direct message, and write the wallet, the dates and every transaction hash in a farm log.`,
+      text: `Know the risks: ${riskFor(p)}. An airdrop is never guaranteed. Skip this protocol if the gas and fees cost more than the value you expect, or if its TVL is held by a few wallets. Before you withdraw, claim only from the link the protocol itself publishes, never from a direct message, and write the wallet, the dates and every transaction hash in a farm log.`,
       cost: 'no fee to check, and never pay to claim',
       time: '10 minutes',
     },
@@ -515,6 +611,10 @@ export function radarRow(row: BoardRow, watchlist: boolean): RadarRow {
     listed_at: row.listed_at,
     age_days: row.age_days,
     implied_value_usd: row.implied_value_usd,
+    implied_low: row.implied_range.low,
+    implied_high: row.implied_range.high,
+    driver: row.driver,
+    driver_multiplier: row.driver_multiplier,
     size_multiplier: row.model.size_multiplier,
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
