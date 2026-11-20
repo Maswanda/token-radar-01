@@ -28,12 +28,20 @@
 // what it does not know. A seven-day growth the snapshot does not report is treated as 0%:
 // no bonus, no penalty, because unreported is not zero. An unknown age uses 365 days for
 // maturity, a conservative default below the board's median age of 421 days, and the dashboard
-// says so. Every row now carries its implied range, the lowest and highest value across
-// sensitivity runs that shift the growth weight, the unknown-age default and the size exponent,
-// and its main driver, the multiplier furthest from 1.0. Multipliers are stored to six
-// decimals, so a reader who multiplies the shown figures lands within a few hundred dollars
-// of the implied value. No protocol name is ever special-cased: the same function scores
-// every row.
+// says so. Every row now carries its implied range, the lowest and highest value across two
+// kinds of doubt: the sensitivity runs that shift the growth weight, the unknown-age default
+// and the size exponent, and input noise on the snapshot's own figures (TVL ±5% as a
+// point-in-time measurement band, seven-day growth ±2 percentage points when reported and
+// ±25 points when not reported, age ±30 days when known and 180–730 days when unknown).
+// Rows with unreported growth or an unknown age therefore carry a wider range, as they
+// should: less is known about them. Every row also carries its main driver, the multiplier
+// furthest from 1.0. Multipliers are stored to six decimals, so a reader who multiplies the
+// shown figures lands within a few hundred dollars of the implied value. Each farm plan ends
+// with its total cost — gas across every transaction in the plan, at the midpoint of the
+// gas band for its chain, plus a $1 withdrawal fee — set against the protocol's implied
+// value as a ratio, never as a promised return: implied value is the whole protocol's
+// modelled value, not a farmer's payout, and an airdrop is never guaranteed. No protocol
+// name is ever special-cased: the same function scores every row.
 
 /** One protocol entry from the sealed snapshot: exactly its ten fields. */
 export interface SnapshotProtocol {
@@ -135,6 +143,8 @@ export interface BoardRow {
     age_days: number | null;
   };
   farm_steps: string[];
+  /** Total farm cost in USD: gas across every transaction in the plan plus the $1 withdrawal fee (see farmCost). Capital is NOT part of it — it stays in the position. */
+  farm_cost_usd: number;
 }
 
 /** A board row's compact form for data.js; the farm plan is generated in the page. */
@@ -158,6 +168,7 @@ export interface RadarRow {
   growth_multiplier: number;
   maturity_multiplier: number;
   reach_multiplier: number;
+  farm_cost_usd: number;
   watchlist: boolean;
 }
 
@@ -228,9 +239,39 @@ export function ageDays(asOf: string, listedAt: string | null): number | null {
 const round6 = (n: number): number => Math.round(n * 1e6) / 1e6;
 
 /**
+ * The four multipliers and the implied value for one set of inputs under `model`.
+ * `ageForModel` is already resolved: the protocol's known age in days, or the model's
+ * unknown-age default when it has none. The formula is the model's whole claim: size has
+ * diminishing returns, growth weighs most, a longer run with no token adds pent-up value,
+ * and more chains widen the surface. Every scorer — the point estimate, the sensitivity
+ * runs and the input-noise corners — goes through this one function, so they can never drift.
+ */
+function impliedBreakdown(
+  tvlUsd: number,
+  change7d: number | null,
+  ageForModel: number,
+  chainCount: number,
+  model: ModelConstants,
+): {
+  implied: number;
+  sizeMult: number;
+  growthPct: number;
+  growthMult: number;
+  maturityMult: number;
+  reachMult: number;
+} {
+  const sizeMult = clamp(Math.pow(tvlUsd / model.size_ref_usd, model.size_exponent), model.size_floor, model.size_cap);
+  const growthPct = clamp(finite(change7d, 0), model.growth_floor, model.growth_cap);
+  const growthMult = 1 + (growthPct / 100) * model.growth_weight;
+  const maturityMult = model.maturity_floor + (clamp(ageForModel, 0, model.maturity_days) / model.maturity_days) * model.maturity_range;
+  const extraChains = clamp(chainCount - 1, 0, model.reach_max_chains);
+  const reachMult = 1 + extraChains * model.reach_per_chain;
+  const implied = Math.max(1, Math.round(tvlUsd * model.base_multiple * sizeMult * growthMult * maturityMult * reachMult));
+  return { implied, sizeMult, growthPct, growthMult, maturityMult, reachMult };
+}
+
+/**
  * The four multipliers and the implied value one protocol gets under `model`.
- * The formula is the model's whole claim: size has diminishing returns, growth weighs most,
- * a longer run with no token adds pent-up value, and more chains widen the surface.
  */
 export function impliedValue(
   protocol: SnapshotProtocol,
@@ -246,15 +287,9 @@ export function impliedValue(
   age: number | null;
 } {
   const age = ageDays(asOf, protocol.listed_at);
-  const sizeMult = clamp(Math.pow(protocol.tvl_usd / model.size_ref_usd, model.size_exponent), model.size_floor, model.size_cap);
-  const growthPct = clamp(finite(protocol.change_7d, 0), model.growth_floor, model.growth_cap);
-  const growthMult = 1 + (growthPct / 100) * model.growth_weight;
   const ageForModel = age ?? model.unknown_age_days;
-  const maturityMult = model.maturity_floor + (clamp(ageForModel, 0, model.maturity_days) / model.maturity_days) * model.maturity_range;
-  const extraChains = clamp(protocol.chains.length - 1, 0, model.reach_max_chains);
-  const reachMult = 1 + extraChains * model.reach_per_chain;
-  const implied = Math.max(1, Math.round(protocol.tvl_usd * model.base_multiple * sizeMult * growthMult * maturityMult * reachMult));
-  return { implied, sizeMult, growthPct, growthMult, maturityMult, reachMult, age };
+  const out = impliedBreakdown(protocol.tvl_usd, protocol.change_7d, ageForModel, protocol.chains.length, model);
+  return { ...out, age };
 }
 
 /** The sensitivity runs: the baseline model, each key weight shifted once, and the two combined extremes. The board's point estimate always uses MODEL; these runs only set each row's low/high range, so the baseline implied value always lies inside its own range. */
@@ -280,6 +315,70 @@ export function sensitivityRange(protocol: SnapshotProtocol, asOf: string): { lo
     if (value > high) high = value;
   }
   return { low, high };
+}
+
+/**
+ * Input-noise assumptions: how far the snapshot's own figures could be off, stated so a
+ * reader can argue with them. TVL ±5% is a point-in-time measurement band — DefiLlama TVL
+ * moves with prices and deposits within a day, so the figure on the snapshot date is not
+ * exact to the dollar. Seven-day growth ±2 percentage points is ordinary reporting noise
+ * when a figure is published; when nothing is reported at all the band is ±25 points
+ * around the neutral 0% (half the model's growth floor), because a week with no report
+ * could plausibly have moved that far, and pretending it is known would understate the
+ * doubt. Age ±30 days covers listing-date rounding when the age is known; when it is
+ * unknown the band is 180–730 days, the same plausible span the sensitivity runs sweep
+ * for the unknown-age default, because the true age could sit anywhere in it. These bands
+ * are deliberately wider for missing data: a row with unreported growth or an unknown age
+ * gets a wider range, as it should.
+ */
+export const INPUT_NOISE = {
+  tvl_pct: 0.05,
+  growth_pp: 2,
+  growth_unknown_pp: 25,
+  age_days: 30,
+  unknown_age_low_days: 180,
+  unknown_age_high_days: 730,
+};
+
+/**
+ * A row's implied value at the two input-noise corners, under the baseline model: every
+ * input pushed low together, and every input pushed high together. Implied value rises
+ * with TVL, with growth and with age (TVL × size still grows, since size only tapers it),
+ * so the low corner is the row's low and the high corner its high. The point estimate
+ * sits between them by construction.
+ */
+export function inputRange(protocol: SnapshotProtocol, asOf: string): { low: number; high: number } {
+  const age = ageDays(asOf, protocol.listed_at);
+  const lowChange = protocol.change_7d === null ? -INPUT_NOISE.growth_unknown_pp : protocol.change_7d - INPUT_NOISE.growth_pp;
+  const highChange = protocol.change_7d === null ? INPUT_NOISE.growth_unknown_pp : protocol.change_7d + INPUT_NOISE.growth_pp;
+  const lowAge = age === null ? INPUT_NOISE.unknown_age_low_days : Math.max(0, age - INPUT_NOISE.age_days);
+  const highAge = age === null ? INPUT_NOISE.unknown_age_high_days : age + INPUT_NOISE.age_days;
+  const low = impliedBreakdown(
+    protocol.tvl_usd * (1 - INPUT_NOISE.tvl_pct),
+    lowChange,
+    lowAge,
+    protocol.chains.length,
+    MODEL,
+  ).implied;
+  const high = impliedBreakdown(
+    protocol.tvl_usd * (1 + INPUT_NOISE.tvl_pct),
+    highChange,
+    highAge,
+    protocol.chains.length,
+    MODEL,
+  ).implied;
+  return { low, high };
+}
+
+/**
+ * A row's implied range: the union of the parameter-sensitivity range and the input-noise
+ * range. The baseline point estimate is one of the sensitivity runs, so it always lies
+ * inside its own range.
+ */
+export function impliedRange(protocol: SnapshotProtocol, asOf: string): { low: number; high: number } {
+  const param = sensitivityRange(protocol, asOf);
+  const input = inputRange(protocol, asOf);
+  return { low: Math.min(param.low, input.low), high: Math.max(param.high, input.high) };
 }
 
 /** Which multiplier moves a row's implied value most: the one furthest from 1, boost or compression alike. */
@@ -361,8 +460,9 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
   return scored.map((s, i) => {
-    const range = sensitivityRange(s.p, snapshot.as_of);
+    const range = impliedRange(s.p, snapshot.as_of);
     const driven = driverFor(s.sizeMult, s.growthMult, s.maturityMult, s.reachMult);
+    const cost = farmCost(s.p, s.age);
     return {
       rank: i + 1,
       slug: s.p.slug,
@@ -391,6 +491,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
         age_days: s.age,
       },
       farm_steps: farmSteps(s.p, s.age).map(stepText),
+      farm_cost_usd: cost.total,
     };
   });
 }
@@ -426,6 +527,72 @@ export function gasOn(chain: string): string {
     if (names.includes(c)) return cost;
   }
   return 'about $0.10 to $0.50 of gas';
+}
+
+/** The same gas table as gasOn, in dollars per transaction: the midpoint of the band gasOn states ($4–$8 on Ethereum is $6; "about $0.10 to $0.50" is $0.30). A midpoint is a planning figure, not a quote — gas moves with congestion — so the farm plan states the band's midpoint and the dashboard says so. */
+const GAS_USD_TABLE: Array<[string[], number]> = [
+  [['ethereum'], 6],
+  [['solana', 'sui', 'aptos', 'movement', 'seii'], 0.01],
+  [['bnb chain', 'bsc'], 0.2],
+  [['polygon', 'polygon zkevm'], 0.05],
+  [['avalanche', 'fantom', 'cronos'], 0.3],
+  [['tron'], 1],
+  [['bitcoin', 'stacks', 'rootstock'], 2],
+  [['ton'], 0.1],
+  [['near', 'cosmos', 'osmosis'], 0.05],
+];
+
+/** What one transaction costs in dollars on a chain: the midpoint of gasOn's band. */
+export function gasUsd(chain: string): number {
+  const c = chain.toLowerCase();
+  for (const [names, cost] of GAS_USD_TABLE) {
+    if (names.includes(c)) return cost;
+  }
+  return 0.3;
+}
+
+/** Round to whole cents, so gas totals never carry binary-float dust. */
+const round2 = (n: number): number => Math.round(n * 100) / 100;
+
+/** A dollar amount as the farm plan writes it: whole dollars plain, cents to two places. */
+function formatUsd(n: number): string {
+  return Number.isInteger(n) ? `$${n}` : `$${n.toFixed(2)}`;
+}
+
+/** A whole number with thousands separators, for the cost-to-implied ratio. */
+function formatInt(n: number): string {
+  return Math.round(n).toLocaleString('en-US');
+}
+
+/** The $1 exchange withdrawal fee, the same $1 step 2 of the plan already charges. */
+const WITHDRAWAL_FEE_USD = 1;
+
+/**
+ * A farm plan's total cost in dollars: gas across every transaction the plan itself
+ * counts, plus the $1 withdrawal fee. Transactions counted: step 2 (moving USDC in),
+ * step 3 (the main position), step 4 (the second action), one per week of the hold in
+ * step 5 (ceil(holdDays / 7) — a 30-day hold is 5 weekly actions), and one exit
+ * transaction to withdraw at the end. Steps 1, 6 and 7 move no money on-chain. Capital
+ * is NOT a cost here: it stays in the position and comes back on withdrawal, so the
+ * total is only what farming burns. The ratio against implied value is a scale check,
+ * not a return: implied value is the whole protocol's modelled value, not a farmer's
+ * payout, and an airdrop is never guaranteed.
+ */
+export function farmCost(p: SnapshotProtocol, age: number | null): {
+  total: number;
+  gasTotal: number;
+  txCount: number;
+  gasPerTx: number;
+  weeklyTx: number;
+} {
+  const chain = chainOf(p);
+  const gasPerTx = gasUsd(chain);
+  const hold = holdDaysFor(age);
+  const weeklyTx = Math.ceil(hold / 7);
+  const txCount = 4 + weeklyTx;
+  const gasTotal = round2(gasPerTx * txCount);
+  const total = round2(gasTotal + WITHDRAWAL_FEE_USD);
+  return { total, gasTotal, txCount, gasPerTx, weeklyTx };
 }
 
 /** How much capital one farm position needs, from the protocol's own TVL. */
@@ -528,9 +695,11 @@ function riskFor(p: SnapshotProtocol): string {
 }
 
 /**
- * A protocol's farm plan: seven steps, each an action with a cost and a time. The plan is derived
+ * A protocol's farm plan: eight steps, each an action with a cost and a time. The plan is derived
  * from the protocol's own record (category, chains, TVL, age), never from a hand-written list of names.
- * The last step states the plan's risk and when to skip it outright.
+ * Step 7 states the plan's risk and when to skip it outright; step 8 totals what the plan burns
+ * (gas plus the withdrawal fee, capital excluded) and sets it against the protocol's implied value
+ * as a ratio — a scale check, never a promised return.
  */
 export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   const chain = chainOf(p);
@@ -541,6 +710,9 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   const second = secondActionFor(p, capital, chain);
   const small = Math.max(10, Math.round(capital / 5));
   const floor = Math.max(10, Math.round(capital / 2));
+  const cost = farmCost(p, age);
+  const implied = impliedBreakdown(p.tvl_usd, p.change_7d, age ?? MODEL.unknown_age_days, p.chains.length, MODEL).implied;
+  const perDollar = Math.max(1, Math.round(implied / cost.total));
   return [
     {
       text: `Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.`,
@@ -576,6 +748,11 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
       text: `Know the risks: ${riskFor(p)}. An airdrop is never guaranteed. Skip this protocol if the gas and fees cost more than the value you expect, or if its TVL is held by a few wallets. Before you withdraw, claim only from the link the protocol itself publishes, never from a direct message, and write the wallet, the dates and every transaction hash in a farm log.`,
       cost: 'no fee to check, and never pay to claim',
       time: '10 minutes',
+    },
+    {
+      text: `All in, this plan costs about ${formatUsd(cost.total)} — ${formatUsd(cost.gasTotal)} of gas across ${cost.txCount} transactions at about ${formatUsd(cost.gasPerTx)} each on ${chain}, plus a $1 withdrawal fee — on top of ${formatUsd(capital)} of capital that stays in the position. That is about $1 of cost for every $${formatInt(perDollar)} of this protocol's implied value, but implied value is the whole protocol's modelled value, not your payout, and an airdrop is never guaranteed, so only farm if you can afford to lose the fees.`,
+      cost: `about ${formatUsd(cost.total)} all in`,
+      time: `counted across the ${hold}-day hold`,
     },
   ];
 }
@@ -619,6 +796,7 @@ export function radarRow(row: BoardRow, watchlist: boolean): RadarRow {
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
     reach_multiplier: row.model.reach_multiplier,
+    farm_cost_usd: row.farm_cost_usd,
     watchlist,
   };
 }
@@ -706,6 +884,8 @@ export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null
     if (steps.length < 3 || steps.length > 12) return `${r.slug} has ${steps.length} farm steps`;
     for (const s of steps) if (s.length < 20 || s.length > 600) return `${r.slug} has a farm step of ${s.length} characters`;
     if (!Number.isSafeInteger(r.implied_value_usd) || r.implied_value_usd <= 0) return `${r.slug} has implied value ${r.implied_value_usd}`;
+    if (r.implied_value_usd < r.implied_range.low || r.implied_value_usd > r.implied_range.high) return `${r.slug} has implied value outside its range`;
+    if (!(r.farm_cost_usd > 0)) return `${r.slug} has farm cost ${r.farm_cost_usd}`;
   }
   return null;
 }
